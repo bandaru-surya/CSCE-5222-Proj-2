@@ -1,0 +1,168 @@
+===== synthetic_data.py =====
+
+"""Synthetic data generation for pancreatic cancer survival."""
+import numpy as np
+import pandas as pd
+
+def generate_synthetic_patients(n_samples: int = 500, seed: int = 42) -> pd.DataFrame:
+    np.random.seed(seed)
+    ages = np.random.normal(loc=68, scale=10, size=n_samples).clip(40, 90)
+    tumor_size = np.random.lognormal(mean=1.5, sigma=0.6, size=n_samples)  # cm
+    ca19_9 = np.random.lognormal(mean=5, sigma=1.2, size=n_samples)
+    stages = np.random.choice(['I', 'II', 'III', 'IV'], size=n_samples, p=[0.1, 0.2, 0.35, 0.35])
+    treatment = np.random.choice(['Surgery', 'Chemo', 'Radio', 'Palliative'], size=n_samples,
+                                 p=[0.25, 0.45, 0.15, 0.15])
+
+    survival = []
+    for s in stages:
+        base = np.random.exponential(scale=18)
+        factor = {'I':1.2,'II':0.9,'III':0.6,'IV':0.35}[s]
+        surv = max(1, np.round(base * factor + np.random.normal(0, 2),1))
+        survival.append(surv)
+
+    df = pd.DataFrame({
+        'Age': np.round(ages,1),
+        'TumorSize_cm': np.round(tumor_size,2),
+        'CA19_9': np.round(ca19_9,1),
+        'Stage': stages,
+        'TreatmentType': treatment,
+        'SurvivalMonths': survival
+    })
+    return df
+
+if __name__ == "__main__":
+    df = generate_synthetic_patients(500)
+    df.to_csv("../data/synthetic_data.csv", index=False)
+    print("Synthetic dataset saved to data/synthetic_data.csv")
+
+
+===== feature_engineering.py =====
+
+"""Feature engineering utilities: correlation filter, RFE, PCA."""
+import pandas as pd
+import numpy as np
+from sklearn.feature_selection import RFE
+from sklearn.linear_model import Lasso
+from sklearn.decomposition import PCA
+
+def remove_correlated(df: pd.DataFrame, threshold: float = 0.85):
+    corr = df.corr().abs()
+    upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
+    to_drop = [column for column in upper.columns if any(upper[column] > threshold)]
+    return df.drop(columns=to_drop), to_drop
+
+def select_features_rfe(X, y, n_features=5):
+    selector = RFE(Lasso(alpha=0.01), n_features_to_select=n_features).fit(X, y)
+    selected = X.columns[selector.support_]
+    return selected
+
+def pca_transform(X, n_components=2):
+    pca = PCA(n_components=n_components).fit(X)
+    X_pca = pca.transform(X)
+    return X_pca, pca
+
+
+===== vae_model.py =====
+
+"""Simple VAE for tabular data (PyTorch)."""
+import torch, torch.nn as nn
+
+class VAE(nn.Module):
+    def __init__(self, input_dim, latent_dim=5):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, 32)
+        self.fc21 = nn.Linear(32, latent_dim)
+        self.fc22 = nn.Linear(32, latent_dim)
+        self.fc3 = nn.Linear(latent_dim, 32)
+        self.fc4 = nn.Linear(32, input_dim)
+
+    def encode(self, x):
+        h1 = torch.relu(self.fc1(x))
+        return self.fc21(h1), self.fc22(h1)
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5*logvar)
+        eps = torch.randn_like(std)
+        return mu + eps*std
+
+    def decode(self, z):
+        h3 = torch.relu(self.fc3(z))
+        return self.fc4(h3)
+
+    def forward(self, x):
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        return self.decode(z), mu, logvar
+
+
+===== train_models.py =====
+
+"""Training utilities for multiple regressors."""
+import pandas as pd, numpy as np, joblib
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import ElasticNet
+from sklearn.svm import SVR
+from sklearn.tree import DecisionTreeRegressor
+from lightgbm import LGBMRegressor
+from xgboost import XGBRegressor
+
+def build_preprocessor(df):
+    num_cols = df.select_dtypes(include=['float64','int64']).columns.drop('SurvivalMonths')
+    cat_cols = df.select_dtypes(include=['object']).columns
+    preproc = ColumnTransformer([
+        ('num', StandardScaler(), num_cols),
+        ('cat', OneHotEncoder(handle_unknown='ignore'), cat_cols)
+    ])
+    return preproc, num_cols, cat_cols
+
+def train_all_models(df):
+    X = df.drop(columns=['SurvivalMonths'])
+    y = df['SurvivalMonths']
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    preproc,_,_ = build_preprocessor(df)
+    models = {
+        'ElasticNet': ElasticNet(alpha=0.1, l1_ratio=0.5, random_state=42),
+        'SVR': SVR(C=10, gamma='scale'),
+        'DecisionTree': DecisionTreeRegressor(max_depth=5, random_state=42),
+        'LightGBM': LGBMRegressor(n_estimators=200, learning_rate=0.05),
+        'XGBoost': XGBRegressor(n_estimators=300, learning_rate=0.05, max_depth=4)
+    }
+    results = {}
+    for name, model in models.items():
+        pipe = Pipeline([('pre', preproc), ('model', model)])
+        pipe.fit(X_train, y_train)
+        pred = pipe.predict(X_test)
+        results[name] = {
+            'MAE': mean_absolute_error(y_test, pred),
+            'MSE': mean_squared_error(y_test, pred)
+        }
+        joblib.dump(pipe, f'../models/{name}_model.pkl')
+    return pd.DataFrame(results).T
+
+
+===== app.py =====
+
+import streamlit as st, pandas as pd, joblib, os
+st.title('Pancreatic Cancer Survival Predictor')
+
+uploaded = st.file_uploader('Upload patient CSV', type='csv')
+if uploaded:
+    data = pd.read_csv(uploaded)
+else:
+    st.info('Using sample synthetic dataset.')
+    data = pd.read_csv('data/synthetic_data.csv')
+
+model_choice = st.selectbox('Choose model', ['ElasticNet','SVR','DecisionTree','LightGBM','XGBoost'])
+model_path = f'models/{model_choice}_model.pkl'
+if not os.path.exists(model_path):
+    st.error('Model file not found. Train models first.')
+else:
+    model = joblib.load(model_path)
+    pred = model.predict(data.drop(columns=['SurvivalMonths'], errors='ignore'))
+    st.write('Predicted survival months:', pred)
+
+
